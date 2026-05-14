@@ -1,35 +1,54 @@
+from logging import Logger
 from typing import Awaitable, Tuple
 from redis.asyncio import Redis
 from pydantic import BaseModel
+
+from server_types import Session
 from uuid import uuid4
 
-class Session(BaseModel):
-    user : str
-
-async def add_user(redis_instance: Redis, user: str) -> str:
-    '''Creates a new session'''
-    session_id = f"session:{str(uuid4())}"
-    session : Session = Session(user= user)
+async def add_user(redis_instance: Redis, logger: Logger, sesh: Session) -> str | None:
+    session_id = str(uuid4())
+    redis_key = f"session:{session_id}"
 
     try:
-
         await redis_instance.hset(
-            session_id,
-            mapping= session.model_dump()
+            redis_key,
+            mapping=sesh.model_dump()
         )
 
-        await redis_instance.expire(session_id, 60)
+        await redis_instance.expire(redis_key, 3600)
 
         return session_id
 
     except Exception as e:
-        return str(e)
+        logger.info(str(e))
+        return None
 
-async def get_all_sessions(redis_instance: Redis):
-    return await redis_instance.keys("session:*")
+async def get_session(
+    redis_instance: Redis,
+    logger: Logger,
+    session_id: str
+) -> Session | None:
 
-async def get_session(redis_instance: Redis, session_id : str):
-    return await redis_instance.get(f"session:{session_id}")
+    try:
+        data = await redis_instance.hgetall(f"session:{session_id}")
+
+        if not data:
+            return None
+
+        return Session(**data)
+
+    except Exception as e:
+        logger.info(str(e))
+        return None
+
+async def delete_session(redis_instance:Redis, logger: Logger, session_id : str) -> int | None:
+    try: 
+        return await redis_instance.delete(f"session:{session_id}")
+    except Exception as e:
+        logger.info(str( e ))
+        return None 
+
 
 ## continous notification might not be needed now
 # async def verify_session(redis_instance: Redis):
