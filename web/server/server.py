@@ -1,3 +1,7 @@
+"""Let AI add proper expection handling, where dependencies return None for error and server propogates important error to client, for now any error can stop server"""
+
+from sqlite3 import DatabaseError
+from uuid import uuid4
 from fastapi import FastAPI, Response, Request
 from fastapi.exceptions import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,12 +18,6 @@ from db import db_handler
 
 ## constants
 credential_db_path: str = os.path.join(os.getcwd(), "db/credentials.db")
-
-class SignupCredentials(BaseModel):
-    username: str
-    password: str
-    session_id: str
-
 
 ## Init
 app = FastAPI()
@@ -41,56 +39,91 @@ session_redis: Redis = Redis(host="localhost", port=6900, decode_responses=True)
 credential_db: db_handler.DB_Handler = db_handler.DB_Handler(credential_db_path)
 
 credential_db_schema: server_types.Schema = server_types.Schema(
-    table_name="logged_in", columns=[("username", "STRING"), ("password", "STRING")]
+    table_name="logged_user", columns=[("username", "TEXT"), ("password", "TEXT")]
 )
 
 credential_db.create_table(credential_db_schema)
 
+async def refresh_or_create_session(req: Request, res: Response):
+    existing_session_id: str | None = req.cookies.get("session_id")
+
+    if not existing_session_id:
+
+        guest_username: str = "".join(
+            secrets.choice(string.ascii_letters + string.digits) for _ in range(29)
+        )
+
+        new_sesh: server_types.Session = server_types.Session(
+            user=guest_username, is_logged_in=0
+        )
+        session_id: str | None = await sh.add_session(
+            session_redis, logger, new_sesh, 60
+        )
+
+        if not session_id:
+            logging.info(f" COULD NOT ADD SESSION WITH")
+            return {"server_msg": "session could not be added"}
+
+        res.set_cookie(
+            key="session_id",
+            value=session_id,
+            httponly=True,
+            secure=False,
+            samesite="lax",
+            max_age=60,
+        )
+        logging.info(f" ADDED SESSION WITH SESSION ID {session_id} ")
+        return {"server_msg": "session added"}
+
+    else:
+        remaining_time: int | None = await sh.get_remaining_time(
+            redis_instance=session_redis, logger=logger, session_id=existing_session_id
+        )
+
+        if remaining_time and remaining_time < 15:
+            await session_redis.expire(f"session:{existing_session_id}", 60, xx=True)
+            res.set_cookie(
+                key="session_id",
+                value=existing_session_id,
+                httponly=True,
+                secure=False,
+                samesite="lax",
+                max_age= remaining_time + 60, ## use variable dont hardcode
+            )
+        else:
+            return {"server_msg": "session already exists"}
 
 ## Endpoints
-@app.post("/")
-async def create_guest_session(res: Response):
-    guest_username: str = "".join(
-        secrets.choice(string.ascii_letters + string.digits) for _ in range(29)
-    )
+@app.get("/home")
+async def home(req : Request, res : Response):
+    await refresh_or_create_session(req,res) 
+    return {"server_meassge":"home"}
 
-    new_sesh : server_types.Session = server_types.Session(user=guest_username, is_logged_in=str( False ))
-    session_id: str | None = await sh.add_user(
-        session_redis, logger, new_sesh 
-    )
-
-    if not session_id:
-        logging.info(f" COULD NOT ADD SESSION WITH")
-        return {"server_msg": "session could not be added"}
-
-    res.set_cookie(
-        key="Session-ID",
-        value=session_id,
-        httponly=True,
-        secure=False,
-        samesite="lax",
-        expires=60,
-    )
-    logging.info(f" ADDED SESSION WITH SESSION ID {session_id} ")
-    return {"server_msg": "session added"}
-
-    
+@app.get("/about")
+async def about(req : Request, res : Response):
+    await refresh_or_create_session(req,res) 
+    return {"server_meassge":"about"}
 
 @app.post("/sign_up")
-async def sign_up(req: Request, res : Response, sign_up_credentials: SignupCredentials):
+async def sign_up(
+    req: Request, res: Response, sign_up_credentials: server_types.SignupCredentials
+):
     # Later replace sqlite
 
-    session_id: str | None = req.cookies.get("Session-ID")
+    session_id: str | None = req.cookies.get("session_id")
 
     if not session_id:
         raise HTTPException(
             status_code=400, detail="Session-ID not found for guest user bad request"
         )
 
-    db_res: str = await credential_db.insert_table(
-        "logged_in", (sign_up_credentials.username, sign_up_credentials.password)
+    db_res: str | None = credential_db.insert_table(
+        "logged_user", (sign_up_credentials.username, sign_up_credentials.password)
     )
-    logging.info(db_res)
+    if db_res:
+        logging.info(db_res)
+    else:
+        raise DatabaseError("Error inserting value in db")
 
     # TODO Handle refersh expiry for logged in user
     temp_session: server_types.Session | None = await sh.get_session(
@@ -101,21 +134,23 @@ async def sign_up(req: Request, res : Response, sign_up_credentials: SignupCrede
         return {"server_msg": "user not signed up successfully"}
 
     new_session: server_types.Session = server_types.Session(
-        user=sign_up_credentials.username, is_logged_in=str(True)
+        user=sign_up_credentials.username, is_logged_in=1
     )
-    await sh.delete_session(session_redis, logger, session_id) 
+    await sh.delete_session(session_redis, logger, session_id)
 
-    new_session_id : str | None = await sh.add_user(session_redis,logger,new_session)
+    new_session_id: str | None = await sh.add_session(
+        session_redis, logger, new_session, 60
+    )
 
     if new_session_id:
         res.set_cookie(
-                key="Session-ID",
-                value=new_session_id,
-                httponly=True,
-                secure=False, #enable this later
-                samesite="lax",
-                expires=60,
-            )
+            key="session_id",
+            value=new_session_id,
+            httponly=True,
+            secure=False,  # enable this later
+            samesite="lax",
+            max_age=60,
+        )
     logging.info(f" ADDED SESSION WITH SESSION ID {session_id} ")
 
     return {"server_msg": "user signed up successfully"}
